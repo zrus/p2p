@@ -9,13 +9,14 @@ use ::libp2p::{
   identify, identity,
   identity::PeerId,
   noise, ping, quic, relay,
-  swarm::{NetworkBehaviour, SwarmBuilder, SwarmEvent},
+  swarm::{keep_alive, NetworkBehaviour, SwarmBuilder, SwarmEvent},
   tcp,
 };
 
 use ::std::{
   error::Error,
   net::{Ipv4Addr, Ipv6Addr},
+  time::Duration,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -50,6 +51,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     })
     .boxed();
 
+  let mut relay_config = relay::Config::default();
+  relay_config.max_circuit_duration = Duration::ZERO;
+
   let behaviour = Behaviour {
     relay: relay::Behaviour::new(local_peer_id, Default::default()),
     ping: ping::Behaviour::new(ping::Config::new()),
@@ -57,6 +61,7 @@ fn main() -> Result<(), Box<dyn Error>> {
       "/RELAY/0.1.0".to_string(),
       local_key.public(),
     )),
+    keep_alive: Default::default(),
   };
 
   let mut swarm =
@@ -110,6 +115,7 @@ struct Behaviour {
   relay: relay::Behaviour,
   ping: ping::Behaviour,
   identify: identify::Behaviour,
+  keep_alive: keep_alive::Behaviour,
 }
 
 fn generate_ed25519(secret_key_seed: u8) -> identity::Keypair {

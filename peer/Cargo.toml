@@ -3,6 +3,21 @@ name = "peer"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bin]]
+name = "peer"
+path = "./src/main.rs"
 
 [dependencies]
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+async-trait = "0.1"
+env_logger = "0.10"
+log = "0.4"
+futures = "0.3"
+tokio = { version = "*", features = ["rt-multi-thread", "fs", "io-util", "io-std", "macros", "test-util", "time", "sync"] }
+libp2p = { version = "*", features = ["full"] }
+tiny-tokio-actor = "*"
+once_cell = "*"
+os-thread-local = "0.1.3"
+dashmap = "*"
+

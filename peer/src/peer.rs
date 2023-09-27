@@ -182,11 +182,13 @@ impl Peer {
       
       let mut discover_tick = ::tokio::time::interval(Duration::from_secs(30));
       let mut cookie = None;
-      let mut rendezvous_node = None;
+      let mut rendezvous_addr: Option<Multiaddr> = None;
+      let mut rendezvous_point = None;
 
       loop {
         ::tokio::select! {
-          _ = discover_tick.tick(), if cookie.is_some() && rendezvous_node.is_some() => {
+          _ = discover_tick.tick(), if cookie.is_some() && rendezvous_addr.is_some() && rendezvous_point.is_some() => {
+            swarm.dial(rendezvous_addr.clone().unwrap().with(Protocol::P2p(rendezvous_point.unwrap())))?;
             swarm
               .behaviour_mut()
               .rendezvous
@@ -194,7 +196,7 @@ impl Peer {
                 Some(rendezvous::Namespace::from_static("aum_pos")),
                 cookie.clone(),
                 None,
-                rendezvous_node.unwrap()
+                rendezvous_point.unwrap()
               );
           }
           Ok(Some(ref line)) = stdin.next_line() => {
@@ -289,7 +291,7 @@ impl Peer {
               }
               Command::RendezvousDiscover { point, addr } => {
                 info!("Discover by rendezvous..");
-                swarm.dial(addr.with(Protocol::P2p(point)))?;
+                swarm.dial(addr.clone().with(Protocol::P2p(point)))?;
 
                 'rdvz: loop {
                   match swarm.select_next_some().await {
@@ -310,7 +312,8 @@ impl Peer {
                   }
                 }
 
-                rendezvous_node.replace(point);
+                rendezvous_addr.replace(addr);
+                rendezvous_point.replace(point);
               }
             }
           }
@@ -390,7 +393,9 @@ impl Peer {
                         }
                       }
                     },
-                    DiscoverFailed { rendezvous_node, namespace, error } => todo!(),
+                    DiscoverFailed { error, .. } => {
+                      error!("Rendezvous discover failed: {error:?}")
+                    },
                     Registered { rendezvous_node, ttl, namespace } => {
                       info!(
                         "Registered for namespace '{}' at rendezvous point {} for the next {} seconds",
@@ -407,7 +412,9 @@ impl Peer {
                         error
                       );
                     },
-                    Expired { peer } => todo!(),
+                    Expired { peer } => {
+                      warn!("Rendezvous inform that Peer {peer} is expired");
+                    },
                   }
                 }
               }

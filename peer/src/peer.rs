@@ -249,7 +249,8 @@ impl Peer {
                   }
                 }
 
-                swarm.listen_on(relay_address.with(libp2p::multiaddr::Protocol::P2pCircuit))?;
+                swarm.listen_on(relay_address.clone().with(Protocol::P2pCircuit))?;
+                swarm.add_external_address(relay_address.with(Protocol::P2pCircuit));
               },
               Command::Dial { relay_address, remote_peer_id } => {
                 match relay_address {
@@ -270,9 +271,6 @@ impl Peer {
               Command::Send { topics, message } => todo!(),
               Command::RendezvousRegister { point, addr } => {
                 info!("Register to rendezvous..");
-                let external_addr = "/ip4/113.161.95.53/tcp/4111".parse::<Multiaddr>()?;
-                // let external_addr = "/ip4/127.0.0.1/tcp/0".parse::<Multiaddr>()?;
-                swarm.add_external_address(external_addr);
                 swarm.dial(addr.with(Protocol::P2p(point)))?;
                                 
                 'rdvz: loop {
@@ -311,6 +309,8 @@ impl Peer {
                     event => debug!("{event:?}"),
                   }
                 }
+
+                rendezvous_node.replace(point);
               }
             }
           }
@@ -380,13 +380,13 @@ impl Peer {
 
                           let p2p_suffix = Protocol::P2p(peer);
                           let address_with_p2p =
-                              if !address.ends_with(&Multiaddr::empty().with(p2p_suffix.clone())) {
-                                  address.clone().with(p2p_suffix)
-                              } else {
-                                  address.clone()
-                              };
+                            if !address.ends_with(&Multiaddr::empty().with(p2p_suffix.clone())) {
+                                address.clone().with(p2p_suffix)
+                            } else {
+                                address.clone()
+                            };
 
-                          swarm.dial(address_with_p2p).unwrap();
+                          swarm.dial(address_with_p2p)?;
                         }
                       }
                     },

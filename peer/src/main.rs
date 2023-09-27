@@ -22,7 +22,7 @@ struct Opts {
   subscribe: Vec<String>,
   #[clap(
     long = "rp",
-    default_value = "12D3KooWD5GfYYkeeXQfC4NmMoxnVeLNdTQ4bU616FVegHWKxPnH"
+    default_value = "12D3KooWENTLiCwwoVwYNbKFEfmNdyHG1jxNn9oPB29JeeZXWjAb"
   )]
   rendezvous_point: ::libp2p::PeerId,
   #[clap(long = "ra", default_value = "/ip4/113.161.95.53/tcp/62649")]

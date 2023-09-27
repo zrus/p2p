@@ -20,4 +20,5 @@ tiny-tokio-actor = "*"
 once_cell = "*"
 os-thread-local = "0.1.3"
 dashmap = "*"
-
+recibo = { version = "*", features = ["serde", "graphics"] }
+void = "*"

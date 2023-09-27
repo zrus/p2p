@@ -1,3 +1,6 @@
+#![allow(warnings)]
+
+mod alive_keeper;
 mod behaviour;
 mod command;
 mod event;

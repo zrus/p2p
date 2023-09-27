@@ -25,6 +25,14 @@ pub enum Command {
     topics: Vec<String>,
     message: Vec<u8>,
   },
+  RendezvousRegister {
+    point: ::libp2p::PeerId,
+    addr: ::libp2p::Multiaddr,
+  },
+  RendezvousDiscover {
+    point: ::libp2p::PeerId,
+    addr: ::libp2p::Multiaddr,
+  },
 }
 
 impl Message for Command {

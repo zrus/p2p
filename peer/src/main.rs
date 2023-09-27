@@ -20,6 +20,15 @@ struct Opts {
   /// Topics to subscribe
   #[clap(long = "sub", value_delimiter = ',')]
   subscribe: Vec<String>,
+  #[clap(
+    long = "rp",
+    default_value = "12D3KooWD5GfYYkeeXQfC4NmMoxnVeLNdTQ4bU616FVegHWKxPnH"
+  )]
+  rendezvous_point: ::libp2p::PeerId,
+  #[clap(long = "ra", default_value = "/ip4/113.161.95.53/tcp/62649")]
+  rendezvous_addr: ::libp2p::Multiaddr,
+  #[clap(short, default_value = "false")]
+  discovery: bool,
 }
 
 fn main() -> Result<(), Box<dyn ::std::error::Error>> {
@@ -51,6 +60,17 @@ fn main() -> Result<(), Box<dyn ::std::error::Error>> {
     ::peer::actor::<Peer>()?.tell(Command::Dial {
       relay_address: opts.relay_address,
       remote_peer_id: peer_id.clone(),
+    })?;
+  }
+  if opts.discovery {
+    ::peer::actor::<Peer>()?.tell(Command::RendezvousDiscover {
+      point: opts.rendezvous_point,
+      addr: opts.rendezvous_addr,
+    })?;
+  } else {
+    ::peer::actor::<Peer>()?.tell(Command::RendezvousRegister {
+      point: opts.rendezvous_point,
+      addr: opts.rendezvous_addr,
     })?;
   }
 

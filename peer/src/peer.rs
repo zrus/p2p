@@ -1,11 +1,10 @@
-use ::std::time::Duration;
-use std::str::FromStr;
+use ::std::{str::FromStr, time::Duration};
 
 use ::anyhow::anyhow;
 use ::async_trait::async_trait;
 use ::futures::{
   channel::mpsc::{self, UnboundedReceiver, UnboundedSender},
-  SinkExt, StreamExt,
+  StreamExt,
 };
 use ::libp2p::{
   core::{transport::OrTransport, upgrade},
@@ -15,7 +14,7 @@ use ::libp2p::{
   identity::Keypair,
   mdns,
   multiaddr::Protocol,
-  noise, ping, relay,
+  noise, ping, relay, rendezvous,
   swarm::{keep_alive, SwarmBuilder, SwarmEvent},
   tcp, yamux, Multiaddr, PeerId, Transport,
 };
@@ -24,6 +23,7 @@ use ::tiny_tokio_actor::{Actor, ActorContext, ActorError, Handler, Message};
 use ::tokio::{io::AsyncBufReadExt, task::JoinHandle};
 
 use crate::{
+  alive_keeper,
   behaviour::{Behaviour, BehaviourEvent},
   command::Command,
   event::SysEvent,
@@ -43,7 +43,9 @@ impl Message for Envelope {
 
 #[async_trait]
 impl Handler<SysEvent, Envelope> for Peer {
-  async fn handle(&mut self, _: Envelope, _: &mut ActorContext<SysEvent>) {}
+  async fn handle(&mut self, _: Envelope, _: &mut ActorContext<SysEvent>) {
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+  }
 }
 
 pub struct Peer {
@@ -86,7 +88,7 @@ impl Peer {
     info!("Local peer id: {local_peer_id}");
 
     // Keep alive behaviour configuration
-    let keep_alive = keep_alive::Behaviour::default();
+    let keep_alive = alive_keeper::Behaviour::default();
 
     // Ping behaviour configuration
     let ping_config = ping::Config::new()
@@ -117,6 +119,9 @@ impl Peer {
     // DCUtR behaviour configuration
     let dcutr = dcutr::Behaviour::new(local_peer_id);
 
+    // Rendezvous client behaviour configuration
+    let rendezvous = rendezvous::client::Behaviour::new(local_key.clone());
+
     // TCP transport
     let tcp_transport_config =
       tcp::Config::new().nodelay(true).port_reuse(true);
@@ -136,12 +141,13 @@ impl Peer {
 
     let behaviour = Behaviour {
       ping,
-      mdns,
+      // mdns,
       gossip,
       identify,
       relay,
       dcutr,
       keep_alive,
+      rendezvous,
     };
 
     let mut swarm =
@@ -173,8 +179,24 @@ impl Peer {
     Ok(::tokio::runtime::Handle::current().spawn(async move {
       let mut stdin = ::tokio::io::BufReader::new(::tokio::io::stdin()).lines();
       let mut publish_topics = vec![];
+      
+      let mut discover_tick = ::tokio::time::interval(Duration::from_secs(30));
+      let mut cookie = None;
+      let mut rendezvous_node = None;
+
       loop {
         ::tokio::select! {
+          _ = discover_tick.tick(), if cookie.is_some() && rendezvous_node.is_some() => {
+            swarm
+              .behaviour_mut()
+              .rendezvous
+              .discover(
+                Some(rendezvous::Namespace::from_static("aum_pos")),
+                cookie.clone(),
+                None,
+                rendezvous_node.unwrap()
+              );
+          }
           Ok(Some(ref line)) = stdin.next_line() => {
             for topic in publish_topics.iter() {
               let topic = gossipsub::Sha256Topic::new(topic);
@@ -246,26 +268,70 @@ impl Peer {
                 }
               },
               Command::Send { topics, message } => todo!(),
+              Command::RendezvousRegister { point, addr } => {
+                info!("Register to rendezvous..");
+                let external_addr = "/ip4/113.161.95.53/tcp/4111".parse::<Multiaddr>()?;
+                // let external_addr = "/ip4/127.0.0.1/tcp/0".parse::<Multiaddr>()?;
+                swarm.add_external_address(external_addr);
+                swarm.dial(addr.with(Protocol::P2p(point)))?;
+                                
+                'rdvz: loop {
+                  match swarm.select_next_some().await {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == point => {
+                      swarm.behaviour_mut().rendezvous.register(
+                        rendezvous::Namespace::from_static("aum_pos"),
+                        point,
+                        None,
+                      )?;
+                      break 'rdvz;
+                    }
+                    event => debug!("{event:?}"),
+                  }
+                }
+              }
+              Command::RendezvousDiscover { point, addr } => {
+                info!("Discover by rendezvous..");
+                swarm.dial(addr.with(Protocol::P2p(point)))?;
+
+                'rdvz: loop {
+                  match swarm.select_next_some().await {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == point => {
+                      info!(
+                          "Connected to rendezvous point, discovering nodes in '{}' namespace ...",
+                          "aum_pos"
+                      );
+                      swarm.behaviour_mut().rendezvous.discover(
+                          Some(rendezvous::Namespace::from_static("aum_pos")),
+                          None,
+                          None,
+                          point,
+                      );
+                      break 'rdvz;
+                    }
+                    event => debug!("{event:?}"),
+                  }
+                }
+              }
             }
           }
           event = swarm.select_next_some() => match event {
             SwarmEvent::Behaviour(event) => {
               match event {
                 BehaviourEvent::KeepAlive(_) => {},
-                BehaviourEvent::Mdns(mdns) => match mdns {
-                  mdns::Event::Discovered(discovered) => {
-                    for (peer, addr) in discovered {
-                      info!("New peer {peer} at {addr}");
-                      swarm.behaviour_mut().gossip.add_explicit_peer(&peer);
-                    }
-                  },
-                  mdns::Event::Expired(expired) => {
-                    for (peer, addr) in expired {
-                      warn!("Peer {peer} at {addr} expired");
-                      swarm.behaviour_mut().gossip.remove_explicit_peer(&peer);
-                    }
-                  },
-                },
+                // BehaviourEvent::Mdns(mdns) => match mdns {
+                //   mdns::Event::Discovered(discovered) => {
+                //     for (peer, addr) in discovered {
+                //       info!("New peer {peer} at {addr}");
+                //       swarm.behaviour_mut().gossip.add_explicit_peer(&peer);
+                //     }
+                //   },
+                //   mdns::Event::Expired(expired) => {
+                //     for (peer, addr) in expired {
+                //       warn!("Peer {peer} at {addr} expired");
+                //       swarm.behaviour_mut().gossip.remove_explicit_peer(&peer);
+                //     }
+                //   },
+                // },
                 BehaviourEvent::Gossip(gossib) => match gossib {
                   gossipsub::Event::Message { propagation_source: _, message_id: _, message } => {
                     let msg = String::from_utf8_lossy(&message.data);
@@ -294,15 +360,55 @@ impl Peer {
                 },
                 BehaviourEvent::Dcutr(dcutr) => {
                   info!("DCUtR event: {dcutr:?}");
-                  match dcutr {
-                    libp2p::dcutr::Event::DirectConnectionUpgradeSucceeded { remote_peer_id } => {
-                      _ = swarm.behaviour_mut().gossip.add_explicit_peer(&remote_peer_id);
-                    },
-                    _ => {}
+                  if let libp2p::dcutr::Event::DirectConnectionUpgradeSucceeded { remote_peer_id } = dcutr {
+                    _ = swarm.behaviour_mut().gossip.add_explicit_peer(&remote_peer_id);
                   }
                 },
                 BehaviourEvent::Ping(ping) => {
                   debug!("{ping:?}");
+                }
+                BehaviourEvent::Rendezvous(rendezvous) => {
+                  use rendezvous::client::Event::*;
+                  match rendezvous {
+                    Discovered { registrations, cookie: new_cookie, .. } => {
+                      cookie.replace(new_cookie);
+
+                      for registration in registrations {
+                        for address in registration.record.addresses() {
+                          let peer = registration.record.peer_id();
+                          info!("Discovered peer {} at {}", peer, address);
+
+                          let p2p_suffix = Protocol::P2p(peer);
+                          let address_with_p2p =
+                              if !address.ends_with(&Multiaddr::empty().with(p2p_suffix.clone())) {
+                                  address.clone().with(p2p_suffix)
+                              } else {
+                                  address.clone()
+                              };
+
+                          swarm.dial(address_with_p2p).unwrap();
+                        }
+                      }
+                    },
+                    DiscoverFailed { rendezvous_node, namespace, error } => todo!(),
+                    Registered { rendezvous_node, ttl, namespace } => {
+                      info!(
+                        "Registered for namespace '{}' at rendezvous point {} for the next {} seconds",
+                        namespace,
+                        rendezvous_node,
+                        ttl
+                      );
+                    },
+                    RegisterFailed { rendezvous_node, namespace, error } => {
+                      error!(
+                        "Failed to register: rendezvous_node={}, namespace={}, error_code={:?}",
+                        rendezvous_node,
+                        namespace,
+                        error
+                      );
+                    },
+                    Expired { peer } => todo!(),
+                  }
                 }
               }
             },
@@ -358,11 +464,12 @@ impl Actor<SysEvent> for Peer {
     let (sender, receiver) = mpsc::unbounded();
     self.sender = Some(sender);
     self.receiver = Some(receiver);
-    let handler = self
-      .build()
-      .await
-      .map_err(|e| ActorError::RuntimeError(e.into()))?;
-    self.handler = Some(handler);
+    self.handler = Some(
+      self
+        .build()
+        .await
+        .map_err(|e| ActorError::RuntimeError(e.into()))?,
+    );
     Ok(())
   }
 }

@@ -454,7 +454,7 @@ async fn handle_connect_relay(
   }
 
   swarm.listen_on(relay_address.clone().with(Protocol::P2pCircuit))?;
-  //  swarm.add_external_address(relay_address.with(Protocol::P2pCircuit));
+  swarm.add_external_address(relay_address.with(Protocol::P2pCircuit));
   Ok(())
 }
 

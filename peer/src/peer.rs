@@ -4,6 +4,7 @@ use ::anyhow::anyhow;
 use ::async_trait::async_trait;
 use ::futures::{
   channel::mpsc::{self, UnboundedReceiver, UnboundedSender},
+  future::Either,
   StreamExt,
 };
 use ::libp2p::{
@@ -16,11 +17,12 @@ use ::libp2p::{
   multiaddr::Protocol,
   noise, ping, relay, rendezvous,
   swarm::{keep_alive, SwarmBuilder, SwarmEvent},
-  tcp, yamux, Multiaddr, PeerId, Transport,
+  tcp, yamux, Multiaddr, PeerId, Swarm, Transport,
 };
 use ::log::*;
 use ::tiny_tokio_actor::{Actor, ActorContext, ActorError, Handler, Message};
 use ::tokio::{io::AsyncBufReadExt, task::JoinHandle};
+use libp2p::rendezvous::Cookie;
 
 use crate::{
   alive_keeper,
@@ -81,8 +83,7 @@ impl Peer {
     }
   }
 
-  async fn build(&mut self) -> R<JoinHandle<R>> {
-    let mut receiver = self.receiver.take().unwrap();
+  async fn build_swarm(&mut self) -> R<Swarm<Behaviour>> {
     let local_key = self.local_key.clone();
     let local_peer_id = self.local_peer_id.clone();
     info!("Local peer id: {local_peer_id}");
@@ -150,10 +151,15 @@ impl Peer {
       rendezvous,
     };
 
-    let mut swarm =
+    let swarm =
       SwarmBuilder::with_tokio_executor(transport, behaviour, local_peer_id)
         .build();
 
+    Ok(swarm)
+  }
+
+  async fn listen(&mut self) -> R<Swarm<Behaviour>> {
+    let mut swarm = self.build_swarm().await?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
     let mut delay = ::tokio::time::interval(Duration::from_secs(1));
@@ -161,8 +167,9 @@ impl Peer {
     loop {
       ::tokio::select! {
         e = swarm.select_next_some() => match e {
-          SwarmEvent::NewListenAddr { listener_id: _, address } => {
+          SwarmEvent::NewListenAddr { address, .. } => {
             info!("New listening at {address}");
+            swarm.add_external_address(address);
           },
           SwarmEvent::Behaviour(_) => {}
           SwarmEvent::IncomingConnection { .. } => {}
@@ -176,10 +183,15 @@ impl Peer {
     }
     drop(delay);
 
-    Ok(::tokio::runtime::Handle::current().spawn(async move {
+    Ok(swarm)
+  }
+
+  async fn handle_event(&mut self, mut swarm: Swarm<Behaviour>) -> R {
+    let mut receiver = self.receiver.take().unwrap();
+
+    self.handler.replace(::tokio::runtime::Handle::current().spawn(async move {
       let mut stdin = ::tokio::io::BufReader::new(::tokio::io::stdin()).lines();
       let mut publish_topics = vec![];
-      
       let mut discover_tick = ::tokio::time::interval(Duration::from_secs(30));
       let mut cookie = None;
       let mut rendezvous_addr: Option<Multiaddr> = None;
@@ -188,134 +200,13 @@ impl Peer {
       loop {
         ::tokio::select! {
           _ = discover_tick.tick(), if cookie.is_some() && rendezvous_addr.is_some() && rendezvous_point.is_some() => {
-            swarm.dial(rendezvous_addr.clone().unwrap().with(Protocol::P2p(rendezvous_point.unwrap())))?;
-            swarm
-              .behaviour_mut()
-              .rendezvous
-              .discover(
-                Some(rendezvous::Namespace::from_static("aum_pos")),
-                cookie.clone(),
-                None,
-                rendezvous_point.unwrap()
-              );
+            handle_discovery_tick(&mut swarm, &mut cookie, &mut rendezvous_addr, &mut rendezvous_point)?;
           }
           Ok(Some(ref line)) = stdin.next_line() => {
-            for topic in publish_topics.iter() {
-              let topic = gossipsub::Sha256Topic::new(topic);
-              if let Err(e) = swarm.behaviour_mut().gossip.publish(topic, line.clone()) {
-                error!("Send failed: {e}");
-              }
-            }
+            handle_send_message(&mut swarm, &publish_topics[..], line);
           }
           Some(command) = receiver.next() => {
-            match command {
-              Command::SubscribeTopics { topics } => {
-                for topic in topics {
-                  _ = swarm.behaviour_mut().gossip.subscribe(&gossipsub::Sha256Topic::new(topic));
-                }
-              },
-              Command::UnsubscribeTopics { topics } => {
-                for topic in topics {
-                  _ = swarm.behaviour_mut().gossip.unsubscribe(&gossipsub::Sha256Topic::new(topic));
-                }
-              },
-              Command::PublishTopics { mut topics } => publish_topics.append(&mut topics),
-              Command::ListenViaRelay { relay_address } => {
-                let mut learned_observed_addr = false;
-                let mut told_relay_observed_addr = false;
-
-                swarm.dial(relay_address.clone())?;
-
-                loop {
-                  match swarm.select_next_some().await {
-                    SwarmEvent::NewListenAddr { .. } => {}
-                    SwarmEvent::Dialing { .. } => {}
-                    SwarmEvent::ConnectionEstablished { .. } => {}
-                    SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Sent { .. })) => {
-                      info!("Told relay its public address.");
-                      told_relay_observed_addr = true;
-                    }
-                    SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
-                      info: identify::Info { observed_addr, .. },
-                      ..
-                    })) => {
-                      info!("Relay told us our public address: {observed_addr:?}");
-                      swarm.add_external_address(observed_addr);
-                      learned_observed_addr = true;
-                    }
-                    event => debug!("{event:?}"),
-                  }
-
-                  if learned_observed_addr && told_relay_observed_addr {
-                    break;
-                  }
-                }
-
-                swarm.listen_on(relay_address.clone().with(Protocol::P2pCircuit))?;
-                swarm.add_external_address(relay_address.with(Protocol::P2pCircuit));
-              },
-              Command::Dial { relay_address, remote_peer_id } => {
-                match relay_address {
-                  Some(addr) => {
-                    swarm.dial(
-                      addr
-                        .with(libp2p::multiaddr::Protocol::P2pCircuit)
-                        .with(libp2p::multiaddr::Protocol::P2p(remote_peer_id)),
-                      )?;
-                  }
-                  None => {
-                    swarm.dial(
-                      Multiaddr::from_str("/ip4/192.168.1.18/tcp/63413")?.with(Protocol::P2p(remote_peer_id))
-                    )?;
-                  }
-                }
-              },
-              Command::Send { topics, message } => todo!(),
-              Command::RendezvousRegister { point, addr } => {
-                info!("Register to rendezvous..");
-                swarm.dial(addr.with(Protocol::P2p(point)))?;
-                                
-                'rdvz: loop {
-                  match swarm.select_next_some().await {
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == point => {
-                      swarm.behaviour_mut().rendezvous.register(
-                        rendezvous::Namespace::from_static("aum_pos"),
-                        point,
-                        None,
-                      )?;
-                      break 'rdvz;
-                    }
-                    event => debug!("{event:?}"),
-                  }
-                }
-              }
-              Command::RendezvousDiscover { point, addr } => {
-                info!("Discover by rendezvous..");
-                swarm.dial(addr.clone().with(Protocol::P2p(point)))?;
-
-                'rdvz: loop {
-                  match swarm.select_next_some().await {
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == point => {
-                      info!(
-                          "Connected to rendezvous point, discovering nodes in '{}' namespace ...",
-                          "aum_pos"
-                      );
-                      swarm.behaviour_mut().rendezvous.discover(
-                          Some(rendezvous::Namespace::from_static("aum_pos")),
-                          None,
-                          None,
-                          point,
-                      );
-                      break 'rdvz;
-                    }
-                    event => debug!("{event:?}"),
-                  }
-                }
-
-                rendezvous_addr.replace(addr);
-                rendezvous_point.replace(point);
-              }
-            }
+            handle_command(&mut swarm, command, &mut publish_topics, &mut rendezvous_addr, &mut rendezvous_point).await?;
           }
           event = swarm.select_next_some() => match event {
             SwarmEvent::Behaviour(event) => {
@@ -371,51 +262,7 @@ impl Peer {
                   debug!("{ping:?}");
                 }
                 BehaviourEvent::Rendezvous(rendezvous) => {
-                  use rendezvous::client::Event::*;
-                  match rendezvous {
-                    Discovered { registrations, cookie: new_cookie, .. } => {
-                      cookie.replace(new_cookie);
-
-                      for registration in registrations {
-                        for address in registration.record.addresses() {
-                          let peer = registration.record.peer_id();
-                          info!("Discovered peer {} at {}", peer, address);
-
-                          let p2p_suffix = Protocol::P2p(peer);
-                          let address_with_p2p =
-                            if !address.ends_with(&Multiaddr::empty().with(p2p_suffix.clone())) {
-                                address.clone().with(p2p_suffix)
-                            } else {
-                                address.clone()
-                            };
-
-                          swarm.dial(address_with_p2p)?;
-                        }
-                      }
-                    },
-                    DiscoverFailed { error, .. } => {
-                      error!("Rendezvous discover failed: {error:?}")
-                    },
-                    Registered { rendezvous_node, ttl, namespace } => {
-                      info!(
-                        "Registered for namespace '{}' at rendezvous point {} for the next {} seconds",
-                        namespace,
-                        rendezvous_node,
-                        ttl
-                      );
-                    },
-                    RegisterFailed { rendezvous_node, namespace, error } => {
-                      error!(
-                        "Failed to register: rendezvous_node={}, namespace={}, error_code={:?}",
-                        rendezvous_node,
-                        namespace,
-                        error
-                      );
-                    },
-                    Expired { peer } => {
-                      warn!("Rendezvous inform that Peer {peer} is expired");
-                    },
-                  }
+                  handle_rendezvous_event(&mut swarm, &mut cookie, rendezvous)?;
                 }
               }
             },
@@ -440,6 +287,7 @@ impl Peer {
             },
             SwarmEvent::NewListenAddr { address, .. } => {
               info!("New listening at {address}");
+              swarm.add_external_address(address);
             },
             SwarmEvent::ExpiredListenAddr { address, .. } => {
               warn!("Listening expired at {address}");
@@ -458,8 +306,269 @@ impl Peer {
           }
         }
       }
-    }))
+
+      R::Ok(())
+    }));
+
+    Ok(())
   }
+}
+
+fn handle_discovery_tick(
+  swarm: &mut Swarm<Behaviour>,
+  cookie: &mut Option<Cookie>,
+  rendezvous_addr: &mut Option<Multiaddr>,
+  rendezvous_point: &mut Option<PeerId>,
+) -> R {
+  swarm.dial(
+    rendezvous_addr
+      .clone()
+      .unwrap()
+      .with(Protocol::P2p(rendezvous_point.unwrap())),
+  )?;
+  swarm.behaviour_mut().rendezvous.discover(
+    Some(rendezvous::Namespace::from_static("aum_pos")),
+    cookie.clone(),
+    None,
+    rendezvous_point.unwrap(),
+  );
+  Ok(())
+}
+
+fn handle_send_message(
+  swarm: &mut Swarm<Behaviour>,
+  publishes: &[String],
+  message: &str,
+) {
+  for topic in publishes.iter() {
+    let topic = gossipsub::Sha256Topic::new(topic);
+    if let Err(e) = swarm.behaviour_mut().gossip.publish(topic, message.clone())
+    {
+      error!("Send failed: {e}");
+    }
+  }
+}
+
+async fn handle_command(
+  swarm: &mut Swarm<Behaviour>,
+  command: Command,
+  publish_topics: &mut Vec<String>,
+  rendezvous_addr: &mut Option<Multiaddr>,
+  rendezvous_point: &mut Option<PeerId>,
+) -> R {
+  match command {
+    Command::SubscribeTopics { topics } => {
+      for topic in topics {
+        _ = swarm
+          .behaviour_mut()
+          .gossip
+          .subscribe(&gossipsub::Sha256Topic::new(topic));
+      }
+    }
+    Command::UnsubscribeTopics { topics } => {
+      for topic in topics {
+        _ = swarm
+          .behaviour_mut()
+          .gossip
+          .unsubscribe(&gossipsub::Sha256Topic::new(topic));
+      }
+    }
+    Command::PublishTopics { mut topics } => publish_topics.append(&mut topics),
+    Command::ListenViaRelay { relay_address } => {
+      handle_connect_relay(swarm, relay_address).await?;
+    }
+    Command::Dial {
+      relay_address,
+      remote_peer_id,
+    } => match relay_address {
+      Some(addr) => {
+        swarm.dial(
+          addr
+            .with(libp2p::multiaddr::Protocol::P2pCircuit)
+            .with(libp2p::multiaddr::Protocol::P2p(remote_peer_id)),
+        )?;
+      }
+      None => {
+        swarm.dial(
+          Multiaddr::from_str("/ip4/192.168.1.18/tcp/63413")?
+            .with(Protocol::P2p(remote_peer_id)),
+        )?;
+      }
+    },
+    Command::Send { topics, message } => todo!(),
+    Command::RendezvousRegister { point, addr } => {
+      handle_register_rendezvous(swarm, addr, point).await?;
+    }
+    Command::RendezvousDiscover { point, addr } => {
+      handle_discover_rendezvous(
+        swarm,
+        addr,
+        point,
+        rendezvous_addr,
+        rendezvous_point,
+      )
+      .await?;
+    }
+  }
+  Ok(())
+}
+
+async fn handle_connect_relay(
+  swarm: &mut Swarm<Behaviour>,
+  relay_address: Multiaddr,
+) -> R {
+  let mut learned_observed_addr = false;
+  let mut told_relay_observed_addr = false;
+
+  swarm.dial(relay_address.clone())?;
+
+  loop {
+    match swarm.select_next_some().await {
+      SwarmEvent::NewListenAddr { address, .. } => {
+        swarm.add_external_address(address);
+      }
+      SwarmEvent::Dialing { .. } => {}
+      SwarmEvent::ConnectionEstablished { .. } => {}
+      SwarmEvent::Behaviour(BehaviourEvent::Identify(
+        identify::Event::Sent { .. },
+      )) => {
+        info!("Told relay its public address.");
+        told_relay_observed_addr = true;
+      }
+      SwarmEvent::Behaviour(BehaviourEvent::Identify(
+        identify::Event::Received {
+          info: identify::Info { observed_addr, .. },
+          ..
+        },
+      )) => {
+        info!("Relay told us our public address: {observed_addr:?}");
+        swarm.add_external_address(observed_addr);
+        learned_observed_addr = true;
+      }
+      event => debug!("{event:?}"),
+    }
+
+    if learned_observed_addr && told_relay_observed_addr {
+      break;
+    }
+  }
+
+  swarm.listen_on(relay_address.clone().with(Protocol::P2pCircuit))?;
+  //  swarm.add_external_address(relay_address.with(Protocol::P2pCircuit));
+  Ok(())
+}
+
+async fn handle_register_rendezvous(
+  swarm: &mut Swarm<Behaviour>,
+  addr: Multiaddr,
+  point: PeerId,
+) -> R {
+  info!("Register to rendezvous..");
+  swarm.dial(addr.with(Protocol::P2p(point)))?;
+  'rdvz: loop {
+    match swarm.select_next_some().await {
+      SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == point => {
+        swarm.behaviour_mut().rendezvous.register(
+          rendezvous::Namespace::from_static("aum_pos"),
+          point,
+          None,
+        )?;
+        break 'rdvz;
+      }
+      event => debug!("{event:?}"),
+    }
+  }
+  Ok(())
+}
+
+async fn handle_discover_rendezvous(
+  swarm: &mut Swarm<Behaviour>,
+  addr: Multiaddr,
+  point: PeerId,
+  rendezvous_addr: &mut Option<Multiaddr>,
+  rendezvous_point: &mut Option<PeerId>,
+) -> R {
+  info!("Discover by rendezvous..");
+  swarm.dial(addr.clone().with(Protocol::P2p(point)))?;
+
+  'rdvz: loop {
+    match swarm.select_next_some().await {
+      SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == point => {
+        info!("Connected to rendezvous point, discovering nodes in '{}' namespace ...", "aum_pos");
+        swarm.behaviour_mut().rendezvous.discover(
+          Some(rendezvous::Namespace::from_static("aum_pos")),
+          None,
+          None,
+          point,
+        );
+        break 'rdvz;
+      }
+      event => debug!("{event:?}"),
+    }
+  }
+
+  rendezvous_addr.replace(addr);
+  rendezvous_point.replace(point);
+  Ok(())
+}
+
+fn handle_rendezvous_event(
+  swarm: &mut Swarm<Behaviour>,
+  cookie: &mut Option<Cookie>,
+  event: rendezvous::client::Event,
+) -> R {
+  use rendezvous::client::Event::*;
+  match event {
+    Discovered {
+      registrations,
+      cookie: new_cookie,
+      ..
+    } => {
+      cookie.replace(new_cookie);
+
+      for registration in registrations {
+        for address in registration.record.addresses() {
+          let peer = registration.record.peer_id();
+          info!("Discovered peer {} at {}", peer, address);
+
+          let p2p_suffix = Protocol::P2p(peer);
+          let address_with_p2p = if !address
+            .ends_with(&Multiaddr::empty().with(p2p_suffix.clone()))
+          {
+            address.clone().with(p2p_suffix)
+          } else {
+            address.clone()
+          };
+
+          swarm.dial(address_with_p2p)?;
+        }
+      }
+    }
+    DiscoverFailed { error, .. } => {
+      error!("Rendezvous discover failed: {error:?}")
+    }
+    Registered {
+      rendezvous_node,
+      ttl,
+      namespace,
+    } => {
+      info!("Registered for namespace '{namespace}' at rendezvous point {rendezvous_node} for the next {ttl} seconds");
+    }
+    RegisterFailed {
+      rendezvous_node,
+      namespace,
+      error,
+    } => {
+      error!(
+        "Failed to register: rendezvous_node={}, namespace={}, error_code={:?}",
+        rendezvous_node, namespace, error
+      );
+    }
+    Expired { peer } => {
+      warn!("Rendezvous inform that Peer {peer} is expired");
+    }
+  }
+  Ok(())
 }
 
 #[async_trait]
@@ -471,12 +580,14 @@ impl Actor<SysEvent> for Peer {
     let (sender, receiver) = mpsc::unbounded();
     self.sender = Some(sender);
     self.receiver = Some(receiver);
-    self.handler = Some(
-      self
-        .build()
-        .await
-        .map_err(|e| ActorError::RuntimeError(e.into()))?,
-    );
+    let swarm = self
+      .listen()
+      .await
+      .map_err(|e| ActorError::RuntimeError(e.into()))?;
+    self
+      .handle_event(swarm)
+      .await
+      .map_err(|e| ActorError::RuntimeError(e.into()))?;
     Ok(())
   }
 }

@@ -530,6 +530,9 @@ fn handle_rendezvous_event(
         for address in registration.record.addresses() {
           let peer = registration.record.peer_id();
           info!("Discovered peer {} at {}", peer, address);
+          if swarm.is_connected(&peer) {
+            continue;
+          }
 
           let p2p_suffix = Protocol::P2p(peer);
           let address_with_p2p = if !address
